@@ -31,9 +31,12 @@ namespace {
 
 #define GCLK_CAN1 GCLK_PCHCTRL_GEN_GCLK1_Val
 #define GCLK_CAN0 GCLK_PCHCTRL_GEN_GCLK1_Val
-#define ADAFRUIT_ZEROCAN_TX_BUFFER_SIZE (1)
+// The M_CAN's largest TX FIFO and RX FIFO 0. With 8-byte payloads that is 16
+// bytes per element, 1.5 kB of .canram per instance, and at 500 kbit/s 8 ms of
+// a saturated bus on the way out and 16 ms on the way in.
+#define ADAFRUIT_ZEROCAN_TX_FIFO_SIZE (32)
 #define ADAFRUIT_ZEROCAN_RX_FILTER_SIZE (1)
-#define ADAFRUIT_ZEROCAN_RX_FIFO_SIZE (8)
+#define ADAFRUIT_ZEROCAN_RX_FIFO_SIZE (64)
 #define ADAFRUIT_ZEROCAN_MAX_MESSAGE_LENGTH (8)
 
 namespace {
@@ -98,7 +101,7 @@ struct _canSAME5x_rx_fifo {
 } can_rx_fifo_t;
 
 struct _canSAME5x_state {
-  _canSAME5x_tx_buf tx_buffer[ADAFRUIT_ZEROCAN_TX_BUFFER_SIZE];
+  _canSAME5x_tx_buf tx_buffer[ADAFRUIT_ZEROCAN_TX_FIFO_SIZE];
   _canSAME5x_rx_fifo rx_fifo[ADAFRUIT_ZEROCAN_RX_FIFO_SIZE];
   CanMramSidfe standard_rx_filter[ADAFRUIT_ZEROCAN_RX_FILTER_SIZE];
   CanMramXifde extended_rx_filter[ADAFRUIT_ZEROCAN_RX_FILTER_SIZE];
@@ -245,7 +248,7 @@ int CANSAME5x::begin(long baudrate) {
   {
     CAN_TXBC_Type bc = {};
     bc.bit.TBSA = (uint32_t)state->tx_buffer;
-    bc.bit.NDTB = ADAFRUIT_ZEROCAN_TX_BUFFER_SIZE;
+    bc.bit.TFQS = ADAFRUIT_ZEROCAN_TX_FIFO_SIZE; // no dedicated buffers
     bc.bit.TFQM = 0; // Messages are transmitted in the order submitted
     hw->TXBC.reg = bc.reg;
   }
@@ -348,9 +351,13 @@ int CANSAME5x::endPacket() {
 
   bus_autorecover();
 
-  // TODO wait for TX buffer to free
+  // Queue the frame and return; fail if the TX FIFO is full.
+  if (hw->TXFQS.bit.TFQF) {
+    return 0;
+  }
+  const uint32_t index = hw->TXFQS.bit.TFQPI;
 
-  _canSAME5x_tx_buf &buf = state->tx_buffer[0];
+  _canSAME5x_tx_buf &buf = state->tx_buffer[index];
   buf.txb0.bit.ESI = false;
   buf.txb0.bit.XTD = _txExtended;
   buf.txb0.bit.RTR = _txRtr;
@@ -369,16 +376,9 @@ int CANSAME5x::endPacket() {
     memcpy(buf.data, _txData, _txLength);
   }
 
-  // TX buffer add request
-  hw->TXBAR.reg = 1;
-
-  // wait 8ms (hard coded for now) for TX to occur
-  for (int i = 0; i < 8000; i++) {
-    if (hw->TXBTO.reg & 1) {
-      return true;
-    }
-    yield();
-  }
+  // TX buffer add request, once the element is in RAM
+  __DMB();
+  hw->TXBAR.reg = 1UL << index;
 
   return 1;
 }
